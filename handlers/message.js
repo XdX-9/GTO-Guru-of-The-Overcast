@@ -4,6 +4,11 @@ import {
   getForecast,
   getHourlyForecast,
 } from "../services/weather.js";
+import {
+  setNotification,
+  disableNotification,
+  getNotification,
+} from "../services/notification.js";
 import { t, pluralRu, i18n } from "../utils/i18n.js";
 import { getOutfit } from "../utils/outfit.js";
 
@@ -133,6 +138,42 @@ const cityMap = {
   "віта-поштова": "Vita-Poshtova,UA",
 };
 
+const getMainMenuKeyboard = (lang) => {
+  const opts = {
+    uk: {
+      today: "Сьогодні",
+      tomorrow: "Завтра",
+      three: "3 дні",
+      hourly: "⏳ Детально (24г)",
+      notify: "🔔 Налаштування сповіщень",
+    },
+    ru: {
+      today: "Сегодня",
+      tomorrow: "Завтра",
+      three: "3 дня",
+      hourly: "⏳ Подробно (24ч)",
+      notify: "🔔 Настройки уведомлений",
+    },
+    en: {
+      today: "Today",
+      tomorrow: "Tomorrow",
+      three: "3 days",
+      hourly: "⏳ Detailed (24h)",
+      notify: "🔔 Notification settings",
+    },
+  }[lang];
+
+  return {
+    keyboard: [
+      [opts.today, opts.tomorrow],
+      [opts.three, opts.hourly],
+      [t("change_city", lang), opts.notify],
+    ],
+    resize_keyboard: true,
+    one_time_keyboard: true,
+  };
+};
+
 export const handleMessage = (bot, userData) => async (msg) => {
   const chatId = msg.chat.id;
   const text = msg.text?.trim();
@@ -144,24 +185,46 @@ export const handleMessage = (bot, userData) => async (msg) => {
     userData.set(chatId, user);
   }
 
+  const lang = user.lang || "en";
+
   if (text === "/help") {
-    bot.sendMessage(chatId, t("help", user.lang || "en"), {
-      parse_mode: "Markdown",
+    bot.sendMessage(chatId, t("help", lang), { parse_mode: "Markdown" });
+    return;
+  }
+
+  if (text === "/start") {
+    user.step = "choose_lang";
+    user.city = null;
+    user.lang = null;
+
+    bot.sendMessage(chatId, t("choose_lang", "en"), {
+      reply_markup: {
+        keyboard: [
+          [{ text: "Русский" }, { text: "Українська" }, { text: "English" }],
+        ],
+        resize_keyboard: true,
+        one_time_keyboard: false,
+      },
     });
     return;
   }
+
   if (user.step === "choose_lang") {
     if (text.match(/Українська|Украин/i)) user.lang = "uk";
     else if (text.match(/Русский|Russian/i)) user.lang = "ru";
     else if (text.match(/English/i)) user.lang = "en";
-    else return; // Игнорируем лишний текст
+    else {
+      return;
+    }
 
     user.step = "enter_city";
-    bot.sendMessage(chatId, t("greet", user.lang));
-    bot.sendMessage(chatId, t("send_location", user.lang), {
+    const newLang = user.lang;
+
+    bot.sendMessage(chatId, t("greet", newLang));
+    bot.sendMessage(chatId, t("send_location", newLang), {
       reply_markup: {
         keyboard: [
-          [{ text: t("send_location_btn", user.lang), request_location: true }],
+          [{ text: t("send_location_btn", newLang), request_location: true }],
         ],
         resize_keyboard: true,
         one_time_keyboard: false,
@@ -173,7 +236,7 @@ export const handleMessage = (bot, userData) => async (msg) => {
   if (user.step === "enter_city") {
     const validatedCity = validateCity(text);
     if (!validatedCity) {
-      bot.sendMessage(chatId, t("invalid_city", user.lang));
+      bot.sendMessage(chatId, t("invalid_city", lang));
       return;
     }
 
@@ -181,142 +244,231 @@ export const handleMessage = (bot, userData) => async (msg) => {
     let apiCityName = cityMap[lowerCity];
 
     if (!apiCityName) {
-      const isCyrillic = /[а-яА-ЯіІїЇєЄ]/.test(validatedCity);
-      apiCityName = isCyrillic ? `${validatedCity},UA` : validatedCity;
+      apiCityName = validatedCity;
     }
 
     user.city = apiCityName;
     user.step = "choose_day";
 
-    const opts = {
-      uk: {
-        today: "Сьогодні",
-        tomorrow: "Завтра",
-        three: "3 дні",
-        hourly: "⏳ Детально (24г)",
-      },
-      ru: {
-        today: "Сегодня",
-        tomorrow: "Завтра",
-        three: "3 дня",
-        hourly: "⏳ Подробно (24ч)",
-      },
-      en: {
-        today: "Today",
-        tomorrow: "Tomorrow",
-        three: "3 days",
-        hourly: "⏳ Detailed (24h)",
-      },
-    }[user.lang];
-
-    bot.sendMessage(chatId, t("choose_period", user.lang), {
-      reply_markup: {
-        keyboard: [
-          [opts.today, opts.tomorrow],
-          [opts.three, opts.hourly],
-          [t("change_city", user.lang)],
-        ],
-        resize_keyboard: true,
-        one_time_keyboard: true,
-      },
+    bot.sendMessage(chatId, t("choose_period", lang), {
+      reply_markup: getMainMenuKeyboard(lang),
     });
     return;
   }
 
-  if (user.step === "choose_day") {
+  if (
+    user.step === "choose_day" ||
+    user.step === "notify_time" ||
+    user.step === "notify_disable_confirm"
+  ) {
     const city = user.city;
-    const lang = user.lang;
 
-    if (text === t("change_city", lang)) {
+    if (!city) {
+      user.step = "enter_city";
+      bot.sendMessage(chatId, t("notify_no_city", lang));
+      return;
+    }
+
+    const isToday = text === t("today", lang);
+    const isTomorrow = text === t("tomorrow", lang);
+    const isThreeDays = text === t("three_days", lang) || text.includes("3");
+    const isHourly = text === t("hourly_btn", lang) || text.includes("24");
+    const isNotifySetup = text === t("notify_btn", lang);
+    const isDisableConfirm = text === t("confirm_yes", lang);
+    const isDisableCancel = text === t("confirm_no", lang);
+
+    if (isNotifySetup) {
+      const currentSettings = getNotification(chatId);
+
+      let initialMessage;
+      let keyboardRows = [[t("change_city", lang)]];
+
+      if (currentSettings && currentSettings.status) {
+        initialMessage = t("notify_already_set", lang, {
+          city: currentSettings.city,
+          time: currentSettings.time,
+        });
+        keyboardRows.unshift([
+          t("notify_time_change", lang),
+          t("notify_disable", lang),
+        ]);
+        user.step = "choose_day";
+      } else {
+        initialMessage = t("notify_intro", lang, { city: user.city });
+        keyboardRows.unshift([t("notify_enable", lang)]);
+        user.step = "notify_time";
+      }
+
+      bot.sendMessage(chatId, initialMessage, {
+        parse_mode: "Markdown",
+        reply_markup: {
+          keyboard: keyboardRows,
+          resize_keyboard: true,
+          one_time_keyboard: true,
+        },
+      });
+      return;
+    } else if (text === t("notify_disable", lang)) {
+      user.step = "notify_disable_confirm";
+      bot.sendMessage(chatId, t("notify_disable_confirm", lang), {
+        reply_markup: {
+          keyboard: [[t("confirm_yes", lang)], [t("confirm_no", lang)]],
+          resize_keyboard: true,
+          one_time_keyboard: true,
+        },
+      });
+      return;
+    } else if (user.step === "notify_disable_confirm") {
+      user.step = "choose_day";
+
+      if (isDisableConfirm) {
+        disableNotification(chatId);
+        bot.sendMessage(chatId, t("notify_disable_success", lang));
+      } else if (isDisableCancel) {
+        bot.sendMessage(chatId, t("confirm_no_msg", lang));
+      } else {
+        bot.sendMessage(chatId, "Пожалуйста, нажмите одну из кнопок.", {
+          reply_markup: {
+            keyboard: [[t("confirm_yes", lang)], [t("confirm_no", lang)]],
+            resize_keyboard: true,
+            one_time_keyboard: true,
+          },
+        });
+        return;
+      }
+      bot.sendMessage(chatId, t("choose_period", lang), {
+        reply_markup: getMainMenuKeyboard(lang),
+      });
+      return;
+    } else if (
+      user.step === "notify_time" ||
+      text === t("notify_time_change", lang) ||
+      text === t("notify_enable", lang)
+    ) {
+      const timeRegex = /^([01]?[0-9]|2[0-3]):[0-5][0-9]$/;
+
+      if (
+        text === t("notify_time_change", lang) ||
+        text === t("notify_enable", lang)
+      ) {
+        user.step = "notify_time";
+        bot.sendMessage(
+          chatId,
+          "Введите время в формате *ЧЧ:ММ* (например, 08:30):",
+          { parse_mode: "Markdown" }
+        );
+        return;
+      }
+
+      if (timeRegex.test(text)) {
+        setNotification(chatId, user.city, text, lang);
+        user.step = "choose_day";
+        bot.sendMessage(
+          chatId,
+          t("notify_set_success", lang, { city: user.city, time: text }),
+          { parse_mode: "Markdown" }
+        );
+        bot.sendMessage(chatId, t("choose_period", lang), {
+          reply_markup: getMainMenuKeyboard(lang),
+        });
+        return;
+      } else if (user.step === "notify_time") {
+        bot.sendMessage(
+          chatId,
+          "Неверный формат. Пожалуйста, введите время в формате *ЧЧ:ММ* (например, 08:30):",
+          { parse_mode: "Markdown" }
+        );
+        return;
+      }
+    } else if (text === t("change_city", lang)) {
       user.step = "enter_city";
       bot.sendMessage(chatId, t("change_city_msg", lang), {
         reply_markup: { remove_keyboard: true },
       });
       return;
-    }
-
-    try {
-      const isToday = text === t("today", lang);
-      const isTomorrow = text === t("tomorrow", lang);
-      const isThreeDays = text === t("three_days", lang) || text.includes("3");
-      const isHourly = text === t("hourly_btn", lang) || text.includes("24");
-
-      if (!isToday && !isTomorrow && !isThreeDays && !isHourly) {
-        bot.sendMessage(chatId, t("choose_period", lang));
-        return;
-      }
-
-      if (isToday) {
-        const w = await getCurrentWeather(city, lang);
-        const outfit = getOutfit(w.feels, lang);
-        const emoji = i18n[lang].weather_icons[w.icon] || "🌍";
-
-        const reply =
-          `*${w.name}* ${emoji}\n\n` +
-          `*${w.temp}°C* — ${w.desc}\n` +
-          `${t("feels", lang)}: *${w.feels}°C*\n` +
-          `${t("hum", lang)}: *${w.humidity}%*\n` +
-          `${t("wind", lang)}: *${w.wind.toFixed(1)} м/с*\n\n` +
-          `${outfit}`;
-
-        bot.sendMessage(chatId, reply, { parse_mode: "Markdown" });
-      } else if (isHourly) {
-        const hourlyData = await getHourlyForecast(city, lang);
-
-        let message = `⏳ *${city} (24h)*:\n\n`;
-
-        hourlyData.forEach((h) => {
-          const emoji = i18n[lang].weather_icons[h.icon] || "🔹";
-          message += `🕒 *${h.time}* _(${h.fullDate})_ — ${emoji} *${h.temp}°C*\n`;
-          message += `╰ ${h.desc}, ${t("feels", lang)} ${h.feels}°C\n\n`;
-        });
-
-        bot.sendMessage(chatId, message, { parse_mode: "Markdown" });
-      } else {
-        const requestDays = isThreeDays ? 3 : 2;
-        const forecast = await getForecast(city, lang, requestDays);
-
-        const dataToShow = isTomorrow ? [forecast[1] || forecast[0]] : forecast;
-
-        let titleText = "";
-        if (isTomorrow) {
-          if (lang === "uk") titleText = "📅 Прогноз на Завтра";
-          else if (lang === "ru") titleText = "📅 Прогноз на Завтра";
-          else titleText = "📅 Forecast for Tomorrow";
-        } else {
-          let dayWord = "";
-          if (lang === "ru") dayWord = pluralRu(3, "день", "дня", "дней");
-          else if (lang === "uk") dayWord = "дні";
-          else dayWord = "days";
-          titleText = t("forecast_title", lang, { days: `3 ${dayWord}` });
+    } else if (user.step === "choose_day") {
+      try {
+        if (!isToday && !isTomorrow && !isThreeDays && !isHourly) {
+          bot.sendMessage(chatId, t("choose_period", lang), {
+            reply_markup: getMainMenuKeyboard(lang),
+          });
+          return;
         }
 
-        let message = `*${titleText}* ${city}:\n\n`;
+        if (isToday) {
+          const w = await getCurrentWeather(city, lang);
+          const outfit = getOutfit(w.feels, lang);
+          const emoji = i18n[lang].weather_icons[w.icon] || "🌍";
 
-        dataToShow.forEach((f) => {
-          if (!f) return;
+          const reply =
+            `*${w.name}* ${emoji}\n\n` +
+            `*${w.temp}°C* — ${w.desc}\n` +
+            `${t("feels", lang)}: *${w.feels}°C*\n` +
+            `${t("hum", lang)}: *${w.humidity}%*\n` +
+            `${t("wind", lang)}: *${w.wind.toFixed(1)} м/с*\n\n` +
+            `${outfit}`;
 
-          const emoji = i18n[lang].weather_icons[f.icon] || "🌍";
-          const outfit = getOutfit(f.feels, lang);
+          bot.sendMessage(chatId, reply, { parse_mode: "Markdown" });
+        } else if (isHourly) {
+          const hourlyData = await getHourlyForecast(city, lang);
 
-          message += `🗓 *${f.date}* ${emoji}\n`;
-          message += `*${f.temp}°C* — ${f.desc}\n`;
-          message += `${t("feels", lang)}: *${f.feels}°C*\n`;
-          message += `${t("hum", lang)}: *${f.humidity}%*\n`;
-          message += `${t("wind", lang)}: *${f.wind.toFixed(1)} м/с*\n`;
-          message += `${outfit}\n`;
-          message += `━━━━━━━━━━━━━━━\n\n`;
-        });
+          let message = `⏳ *${city} (24h)*:\n\n`;
 
-        bot.sendMessage(chatId, message, { parse_mode: "Markdown" });
-      }
-    } catch (err) {
-      console.error("Handler error:", err.message);
-      if (err.response?.status === 404) {
-        bot.sendMessage(chatId, t("city_not_found", lang));
-        user.step = "enter_city";
-      } else {
-        bot.sendMessage(chatId, t("try_again", lang));
+          hourlyData.forEach((h) => {
+            const emoji = i18n[lang].weather_icons[h.icon] || "🔹";
+            message += `🕒 *${h.time}* _(${h.fullDate})_ — ${emoji} *${h.temp}°C*\n`;
+            message += `╰ ${h.desc}, ${t("feels", lang)} ${h.feels}°C\n\n`;
+          });
+
+          bot.sendMessage(chatId, message, { parse_mode: "Markdown" });
+        } else {
+          const requestDays = isThreeDays ? 3 : 2;
+          const forecast = await getForecast(city, lang, requestDays);
+
+          const dataToShow = isTomorrow
+            ? [forecast[1] || forecast[0]]
+            : forecast;
+
+          let titleText = "";
+          if (isTomorrow) {
+            if (lang === "uk") titleText = "📅 Прогноз на Завтра";
+            else if (lang === "ru") titleText = "📅 Прогноз на Завтра";
+            else titleText = "📅 Forecast for Tomorrow";
+          } else {
+            let dayWord = "";
+            if (lang === "ru") dayWord = pluralRu(3, "день", "дня", "дней");
+            else if (lang === "uk") dayWord = "дні";
+            else dayWord = "days";
+            titleText = t("forecast_title", lang, { days: `3 ${dayWord}` });
+          }
+
+          let message = `*${titleText}* ${city}:\n\n`;
+
+          dataToShow.forEach((f) => {
+            if (!f) return;
+
+            const emoji = i18n[lang].weather_icons[f.icon] || "🌍";
+            const outfit = getOutfit(f.feels, lang);
+
+            message += `🗓 *${f.date}* ${emoji}\n`;
+            message += `*${f.temp}°C* — ${f.desc}\n`;
+            message += `${t("feels", lang)}: *${f.feels}°C*\n`;
+            message += `${t("hum", lang)}: *${f.humidity}%*\n`;
+            message += `${t("wind", lang)}: *${f.wind.toFixed(1)} м/с*\n`;
+            message += `${outfit}\n`;
+            message += `━━━━━━━━━━━━━━━\n\n`;
+          });
+
+          bot.sendMessage(chatId, message, { parse_mode: "Markdown" });
+        }
+      } catch (err) {
+        console.error("Handler error:", err.message);
+        if (err.response?.status === 404) {
+          bot.sendMessage(chatId, t("city_not_found", lang));
+          user.step = "enter_city";
+        } else {
+          bot.sendMessage(chatId, t("try_again", lang));
+        }
       }
     }
   }
